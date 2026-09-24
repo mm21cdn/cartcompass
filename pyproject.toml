@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cartcompass"
+version = "1.0.0"
+description = "CartCompass UK — 20km Grocery & Loyalty Price Optimizer with UK Postcode Reset and Online + Regular Shop Split Planning"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+cartcompass = "cartcompass.server:main"
