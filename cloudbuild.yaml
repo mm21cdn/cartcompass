@@ -1,0 +1,44 @@
+steps:
+  # Step 1: Run Unit & Integration Tests
+  - name: "python:3.11-slim"
+    id: "unit-tests"
+    entrypoint: "python3"
+    args: ["-m", "unittest", "discover", "-s", "cartcompass", "-p", "*_test.py", "-v"]
+
+  # Step 2: Run Dedicated Golden Dataset Agent Evaluation Harness (>= 95% pass gate)
+  - name: "python:3.11-slim"
+    id: "golden-eval-harness"
+    entrypoint: "python3"
+    args: ["-m", "cartcompass.eval_harness", "--output", "/workspace/eval_report.json"]
+
+  # Step 3: Build Container Image
+  - name: "gcr.io/cloud-builders/docker"
+    id: "build-image"
+    args:
+      - "build"
+      - "-t"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/cartcompass-repo/cartcompass-agent:${SHORT_SHA}"
+      - "."
+
+  # Step 4: Push Image to Artifact Registry
+  - name: "gcr.io/cloud-builders/docker"
+    id: "push-image"
+    args:
+      - "push"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/cartcompass-repo/cartcompass-agent:${SHORT_SHA}"
+
+  # Step 5: Deploy to Google Cloud Run with Secret Manager Mounts
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: "deploy-cloud-run"
+    entrypoint: "gcloud"
+    args:
+      - "run"
+      - "deploy"
+      - "cartcompass-uk-agent"
+      - "--image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/cartcompass-repo/cartcompass-agent:${SHORT_SHA}"
+      - "--region=${_REGION}"
+      - "--platform=managed"
+      - "--set-secrets=GEMINI_API_KEY=GEMINI_API_KEY:latest,RETAILER_CATALOG_API_KEY=RETAILER_CATALOG_API_KEY:latest"
+
+substitutions:
+  _REGION: "europe-west2"

@@ -170,6 +170,41 @@ class SplitBasketOption:
 
 
 @dataclass
+class ToolExecutionEnvelope:
+  """Standardized LLM-guided tool output & actionable error recovery envelope."""
+
+  status: str  # "success" or "error"
+  tool_name: str
+  data: Any = None
+  error_code: str | None = None
+  error_message: str | None = None
+  llm_recovery_instructions: str | None = None
+  retriable: bool = True
+  suggested_arguments: dict[str, Any] = field(default_factory=dict)
+  output_schema_version: str = "1.0"
+
+  def to_dict(self) -> dict[str, Any]:
+    return asdict(self)
+
+
+@dataclass
+class HITLApprovalRequest:
+  """Human-in-the-Loop (HITL) approval gate checkpoint for high-spend or paid-membership actions."""
+
+  request_id: str
+  status: str  # "AUTO_APPROVED_BELOW_THRESHOLD", "PENDING_HUMAN_APPROVAL", "APPROVED", "REJECTED"
+  requires_human_confirmation: bool
+  trigger_reason: str
+  basket_total_gbp: float
+  spend_threshold_gbp: float
+  recommended_action_summary: str
+  created_at_iso: str
+
+  def to_dict(self) -> dict[str, Any]:
+    return asdict(self)
+
+
+@dataclass
 class OptimizationRecommendation:
   run_id: str
   shopping_list_id: str
@@ -191,6 +226,8 @@ class OptimizationRecommendation:
   trace_summary: dict[str, Any]
   online_hybrid_plan: SplitBasketOption | None = None
   online_validity_audit: list[dict[str, Any]] = field(default_factory=list)
+  agent_metadata: dict[str, Any] = field(default_factory=dict)
+  hitl_checkpoint: dict[str, Any] = field(default_factory=dict)
 
   def to_dict(self) -> dict[str, Any]:
     return asdict(self)

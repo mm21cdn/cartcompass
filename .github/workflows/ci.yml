@@ -1,4 +1,4 @@
-name: CartCompass UK CI
+name: CartCompass UK CI & Golden Agent Evaluation
 
 on:
   push:
@@ -7,15 +7,27 @@ on:
     branches: [ main, master ]
 
 jobs:
-  test:
+  test-and-evaluate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Run Unit & Integration Tests
+
+      - name: Run Unit & Integration Test Suite
         run: python3 -m unittest discover -s cartcompass -p "*_test.py" -v
-      - name: Smoke Test CLI Report
+
+      - name: Run Golden Dataset Agent Evaluation Harness (>= 95% Pass Gate)
+        run: python3 -m cartcompass.eval_harness --output eval_report.json
+
+      - name: Smoke Test CLI Optimization Report
         run: python3 app.py --cli --postcode "PO20 3SJ" --no-save
+
+      - name: Upload Golden Evaluation Report Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cartcompass-golden-eval-report
+          path: eval_report.json

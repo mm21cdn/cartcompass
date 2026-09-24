@@ -18,12 +18,40 @@ from cartcompass.models import (
     SplitBasketOption,
     SplitStoreAllocation,
     StoreBasketQuote,
+    ToolExecutionEnvelope,
 )
 
 
 # ---------------------------------------------------------------------------
-# 1. Explicit Tool & Interface Schema Registry (OpenAPI / Function Calling)
+# 1. Explicit Tool & Interface Schema Registry (Input + Output + LLM Recovery)
 # ---------------------------------------------------------------------------
+STANDARD_LLM_ERROR_RECOVERY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "status",
+        "tool_name",
+        "error_code",
+        "error_message",
+        "llm_recovery_instructions",
+        "retriable",
+    ],
+    "properties": {
+        "status": {"type": "string", "enum": ["success", "error"]},
+        "tool_name": {"type": "string"},
+        "error_code": {"type": ["string", "null"]},
+        "error_message": {"type": ["string", "null"]},
+        "llm_recovery_instructions": {
+            "type": ["string", "null"],
+            "description": (
+                "Step-by-step actionable guidance telling the calling LLM agent "
+                "how to repair arguments or select an alternative tool on error."
+            ),
+        },
+        "retriable": {"type": "boolean"},
+        "suggested_arguments": {"type": "object"},
+    },
+}
+
 TOOL_DECLARATIONS: list[dict[str, Any]] = [
     {
         "name": "resolve_uk_postcode",
@@ -43,6 +71,23 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
                 },
             },
         },
+        "output_schema": {
+            "type": "object",
+            "required": ["status", "tool_name", "data"],
+            "properties": {
+                **STANDARD_LLM_ERROR_RECOVERY_SCHEMA["properties"],
+                "data": {
+                    "type": "object",
+                    "required": ["latitude", "longitude", "label", "postcode"],
+                    "properties": {
+                        "latitude": {"type": "number"},
+                        "longitude": {"type": "number"},
+                        "label": {"type": "string"},
+                        "postcode": {"type": "string"},
+                    },
+                },
+            },
+        },
     },
     {
         "name": "parse_pasted_grocery_list",
@@ -58,6 +103,26 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
                 "raw_text": {
                     "type": "string",
                     "description": "Free-text grocery list pasted by the user.",
+                },
+            },
+        },
+        "output_schema": {
+            "type": "object",
+            "required": ["status", "tool_name", "data"],
+            "properties": {
+                **STANDARD_LLM_ERROR_RECOVERY_SCHEMA["properties"],
+                "data": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["name", "quantity", "unit"],
+                        "properties": {
+                            "name": {"type": "string"},
+                            "quantity": {"type": "number"},
+                            "unit": {"type": "string"},
+                            "allow_substitutions": {"type": "boolean"},
+                        },
+                    },
                 },
             },
         },
@@ -100,13 +165,28 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
                 },
             },
         },
+        "output_schema": {
+            "type": "object",
+            "required": ["status", "tool_name", "data"],
+            "properties": {
+                **STANDARD_LLM_ERROR_RECOVERY_SCHEMA["properties"],
+                "data": {
+                    "type": "object",
+                    "required": ["stores_within_radius", "stores_excluded_outside_radius"],
+                    "properties": {
+                        "stores_within_radius": {"type": "array"},
+                        "stores_excluded_outside_radius": {"type": "array"},
+                    },
+                },
+            },
+        },
     },
     {
         "name": "fetch_store_catalog_quote",
         "description": (
             "Queries a specific UK supermarket or online retailer's inventory, "
             "regular prices (GBP £), and loyalty/subscribe member prices for a "
-            "list of normalized shopping items."
+            "list of normalized shopping items, including online basket validity."
         ),
         "parameters": {
             "type": "object",
@@ -124,6 +204,33 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
                             "unit": {"type": "string"},
                             "allow_substitutions": {"type": "boolean"},
                         },
+                    },
+                },
+            },
+        },
+        "output_schema": {
+            "type": "object",
+            "required": ["status", "tool_name", "data"],
+            "properties": {
+                **STANDARD_LLM_ERROR_RECOVERY_SCHEMA["properties"],
+                "data": {
+                    "type": "object",
+                    "required": [
+                        "store",
+                        "line_items",
+                        "missing_items",
+                        "can_fulfill_entire_list",
+                        "effective_best_total",
+                    ],
+                    "properties": {
+                        "store": {"type": "object"},
+                        "line_items": {"type": "array"},
+                        "missing_items": {"type": "array", "items": {"type": "string"}},
+                        "can_fulfill_entire_list": {"type": "boolean"},
+                        "fulfillment_coverage_pct": {"type": "number"},
+                        "regular_subtotal": {"type": "number"},
+                        "loyalty_subtotal": {"type": "number"},
+                        "effective_best_total": {"type": "number"},
                     },
                 },
             },
@@ -156,6 +263,24 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
                 "trips_per_year": {"type": "integer", "default": 52},
             },
         },
+        "output_schema": {
+            "type": "object",
+            "required": ["status", "tool_name", "data"],
+            "properties": {
+                **STANDARD_LLM_ERROR_RECOVERY_SCHEMA["properties"],
+                "data": {
+                    "type": "object",
+                    "required": [
+                        "store_id",
+                        "program_name",
+                        "is_advantageous",
+                        "net_weekly_advantage",
+                        "projected_annual_net_savings",
+                        "rationale",
+                    ],
+                },
+            },
+        },
     },
     {
         "name": "optimize_split_basket_strategy",
@@ -172,6 +297,23 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
                 "store_quotes": {"type": "array"},
                 "user_location": {"type": "object"},
                 "fuel_cost_per_km": {"type": "number"},
+            },
+        },
+        "output_schema": {
+            "type": "object",
+            "required": ["status", "tool_name", "data"],
+            "properties": {
+                **STANDARD_LLM_ERROR_RECOVERY_SCHEMA["properties"],
+                "data": {
+                    "type": "object",
+                    "required": [
+                        "plan_type",
+                        "stores",
+                        "total_cost_with_travel",
+                        "savings_vs_best_single_store",
+                        "rationale",
+                    ],
+                },
             },
         },
     },
@@ -1544,3 +1686,157 @@ def optimize_split_basket_strategy(
         best_option = candidate
 
   return best_option
+
+
+# ---------------------------------------------------------------------------
+# 8. LLM-Guided Tool Execution Engine with Actionable Error Recovery
+# ---------------------------------------------------------------------------
+_VALID_UK_POSTCODE_RE = re.compile(
+    r"^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$|^[A-Z]{1,2}\d[A-Z\d]?$",
+    re.IGNORECASE,
+)
+
+
+def execute_tool_with_llm_guidance(
+    tool_name: str, **kwargs: Any
+) -> ToolExecutionEnvelope:
+  """Executes a registered tool and returns an explicit output schema envelope with LLM recovery instructions on error."""
+  if tool_name == "resolve_uk_postcode":
+    raw_pc = str(kwargs.get("postcode", "") or "").strip()
+    if not raw_pc or not _VALID_UK_POSTCODE_RE.match(raw_pc):
+      return ToolExecutionEnvelope(
+          status="error",
+          tool_name="resolve_uk_postcode",
+          data=None,
+          error_code="INVALID_UK_POSTCODE_FORMAT",
+          error_message=f"Provided postcode '{raw_pc}' is not a valid UK postcode or outward code.",
+          llm_recovery_instructions=(
+              "RECOVERY ACTION: Call `resolve_uk_postcode` again using a standard alphanumeric UK postcode "
+              "(for example 'PO20 3SJ' for Eastergate, 'RH12 1HQ' for Horsham, 'BN1 4GQ' for Brighton, or "
+              "'SW1A 1AA' for London), or omit `postcode` to default to the user's saved Eastergate home coordinate."
+          ),
+          retriable=True,
+          suggested_arguments={"postcode": "PO20 3SJ"},
+      )
+    coord = resolve_uk_postcode(raw_pc)
+    return ToolExecutionEnvelope(
+        status="success",
+        tool_name="resolve_uk_postcode",
+        data={
+            "latitude": coord.latitude,
+            "longitude": coord.longitude,
+            "label": coord.label,
+            "postcode": coord.postcode,
+        },
+    )
+
+  if tool_name == "parse_pasted_grocery_list":
+    raw_text = str(kwargs.get("raw_text", "") or "").strip()
+    if not raw_text:
+      return ToolExecutionEnvelope(
+          status="error",
+          tool_name="parse_pasted_grocery_list",
+          data=[],
+          error_code="EMPTY_GROCERY_LIST_INPUT",
+          error_message="The pasted grocery list text was empty or whitespace-only.",
+          llm_recovery_instructions=(
+              "RECOVERY ACTION: Provide a non-empty multi-line or comma-separated grocery list string in `raw_text` "
+              "(e.g. '2x British Semi-Skimmed Milk 2L\\n1 dozen Free-Range Large Eggs\\n1 pack Whole Almonds 1kg') "
+              "or ask the user which weekly grocery items they want to price-check."
+          ),
+          retriable=True,
+          suggested_arguments={
+              "raw_text": "2x British Semi-Skimmed Milk 2L\n1 dozen Free-Range Large Eggs"
+          },
+      )
+    parsed = parse_pasted_grocery_list(raw_text)
+    return ToolExecutionEnvelope(
+        status="success",
+        tool_name="parse_pasted_grocery_list",
+        data=[
+            {
+                "name": it.name,
+                "quantity": it.quantity,
+                "unit": it.unit,
+                "allow_substitutions": it.allow_substitutions,
+            }
+            for it in parsed
+        ],
+    )
+
+  if tool_name == "discover_stores_within_radius":
+    try:
+      lat = float(kwargs.get("latitude", 50.845561))
+      lon = float(kwargs.get("longitude", -0.643677))
+      rad = float(kwargs.get("radius_km", 20.0))
+    except (TypeError, ValueError) as exc:
+      return ToolExecutionEnvelope(
+          status="error",
+          tool_name="discover_stores_within_radius",
+          data=None,
+          error_code="INVALID_NUMERIC_COORDINATE_OR_RADIUS",
+          error_message=f"Failed to parse numeric coordinates or radius: {exc}",
+          llm_recovery_instructions=(
+              "RECOVERY ACTION: Pass numeric floats for `latitude` (e.g. 50.845561), `longitude` (e.g. -0.643677), "
+              "and `radius_km` (between 1.0 and 50.0, default 20.0)."
+          ),
+          retriable=True,
+          suggested_arguments={
+              "latitude": 50.845561,
+              "longitude": -0.643677,
+              "radius_km": 20.0,
+              "include_online_shops": True,
+          },
+      )
+    if rad <= 0.0 or rad > 100.0:
+      return ToolExecutionEnvelope(
+          status="error",
+          tool_name="discover_stores_within_radius",
+          data=None,
+          error_code="RADIUS_OUT_OF_BOUNDS",
+          error_message=f"Requested radius_km={rad} is outside the supported (0.0, 100.0] km range.",
+          llm_recovery_instructions=(
+              "RECOVERY ACTION: Retry `discover_stores_within_radius` with `radius_km=20.0` (the standard 20km UK search radius)."
+          ),
+          retriable=True,
+          suggested_arguments={
+              "latitude": lat,
+              "longitude": lon,
+              "radius_km": 20.0,
+              "include_online_shops": True,
+          },
+      )
+    loc = GeoCoordinate(
+        latitude=lat,
+        longitude=lon,
+        label=str(kwargs.get("label", "Home (Eastergate, West Sussex, UK)")),
+        postcode=str(kwargs.get("postcode", "PO20 3SJ")),
+    )
+    within, excluded = discover_stores_within_radius(
+        user_location=loc,
+        radius_km=rad,
+        include_online_shops=bool(kwargs.get("include_online_shops", True)),
+    )
+    return ToolExecutionEnvelope(
+        status="success",
+        tool_name="discover_stores_within_radius",
+        data={
+            "stores_within_radius": within,
+            "stores_excluded_outside_radius": excluded,
+        },
+    )
+
+  return ToolExecutionEnvelope(
+      status="error",
+      tool_name=tool_name,
+      data=None,
+      error_code="UNKNOWN_TOOL_NAME",
+      error_message=f"Tool '{tool_name}' is not registered in TOOL_DECLARATIONS.",
+      llm_recovery_instructions=(
+          "RECOVERY ACTION: Choose one of the registered tool names: "
+          "`resolve_uk_postcode`, `parse_pasted_grocery_list`, `discover_stores_within_radius`, "
+          "`fetch_store_catalog_quote`, `analyze_loyalty_advantage`, or `optimize_split_basket_strategy`."
+      ),
+      retriable=True,
+      suggested_arguments={},
+  )

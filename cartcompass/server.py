@@ -169,6 +169,22 @@ def create_request_handler(orchestrator: GroceryOptimizationOrchestrator):
           self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
         return
 
+      if parsed.path == "/api/hitl/approve":
+        try:
+          length = int(self.headers.get("Content-Length", "0"))
+          raw_body = self.rfile.read(length).decode("utf-8") if length else "{}"
+          data = json.loads(raw_body)
+          req_id = str(data.get("request_id", "")).strip()
+          approved = bool(data.get("approved", True))
+          note = str(data.get("reviewer_note", "")).strip()
+          result = orchestrator.hitl_gate.resolve_hitl_request(
+              req_id, approved=approved, reviewer_note=note
+          )
+          self._send_json(result)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+          self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        return
+
       if parsed.path == "/api/optimize":
         try:
           length = int(self.headers.get("Content-Length", "0"))

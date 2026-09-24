@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  cartcompass-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cartcompass-uk-agent
+    ports:
+      - "8765:8765"
+    environment:
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT:-cartcompass-uk-prod}
+      - USE_GCP_SECRET_MANAGER=${USE_GCP_SECRET_MANAGER:-0}
+      - GROCERY_APP_STATE_DIR=/var/lib/cartcompass
+    volumes:
+      - cartcompass_sqlite_data:/var/lib/cartcompass
+    restart: unless-stopped
+
+volumes:
+  cartcompass_sqlite_data:

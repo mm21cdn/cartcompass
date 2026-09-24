@@ -6,7 +6,17 @@ import datetime
 from typing import Any
 import uuid
 
-from cartcompass.memory_store import PersistentMemoryStore
+from cartcompass.agent_adk import (
+    GLOBAL_GUARDRAILS,
+    GLOBAL_HITL_GATE,
+    GLOBAL_MODEL_ROUTER,
+    build_cartcompass_adk_agent_hierarchy,
+)
+from cartcompass.memory_store import (
+    AsyncMemoryConsolidator,
+    ContextWindowManager,
+    PersistentMemoryStore,
+)
 from cartcompass.models import (
     GeoCoordinate,
     OptimizationRecommendation,
@@ -18,6 +28,7 @@ from cartcompass.tools import (
     CANONICAL_CATALOG,
     build_online_plus_regular_shop_plan,
     discover_stores_within_radius,
+    execute_tool_with_llm_guidance,
     fetch_store_catalog_quote,
     optimize_split_basket_strategy,
     parse_pasted_grocery_list,
@@ -26,10 +37,16 @@ from cartcompass.tools import (
 
 
 class GroceryOptimizationOrchestrator:
-  """Coordinates context hydration, UK postcode 20km discovery, online fulfilment validation, GBP pricing, loyalty ROI, and memory persistence."""
+  """Coordinates ADK Multi-Agent workflow, Model Routing, Guardrails, HITL, UK postcode 20km discovery, online validity auditing, GBP pricing, loyalty ROI, and async PII-redacted memory."""
 
   def __init__(self, memory_store: PersistentMemoryStore | None = None) -> None:
     self.memory = memory_store or PersistentMemoryStore()
+    self.adk_hierarchy = build_cartcompass_adk_agent_hierarchy()
+    self.model_router = GLOBAL_MODEL_ROUTER
+    self.guardrails = GLOBAL_GUARDRAILS
+    self.hitl_gate = GLOBAL_HITL_GATE
+    self.context_manager = ContextWindowManager()
+    self.async_memory = AsyncMemoryConsolidator(self.memory)
 
   def execute_weekly_shopping_run(
       self,
@@ -43,12 +60,14 @@ class GroceryOptimizationOrchestrator:
       override_loyalty_programs: list[str] | None = None,
       include_online_shops: bool = True,
       persist_run: bool = True,
+      hitl_spend_threshold_gbp: float = 75.0,
   ) -> OptimizationRecommendation:
-    """Executes the full multi-stage grocery optimization DAG with distributed tracing."""
+    """Executes the full multi-agent ADK grocery optimization pipeline with distributed tracing, guardrails, model routing, and HITL."""
     run_id = f"RUN-{uuid.uuid4().hex[:8].upper()}"
     list_id = f"LIST-{uuid.uuid4().hex[:8].upper()}"
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
     tracer = TraceRecorder()
+    routing_decisions: list[dict[str, Any]] = []
 
     with tracer.start_span(
         "orchestrator.execute_weekly_shopping_run",
@@ -57,14 +76,50 @@ class GroceryOptimizationOrchestrator:
         radius_km=radius_km,
         include_online_shops=include_online_shops,
         currency="GBP",
+        agent_name="CartCompassCoordinatorAgent",
     ) as root_span:
+      # Stage 0: Input Guardrails (Prompt Injection, Domain Safety, PII Scrubbing)
+      input_guardrail_verdict = self.guardrails.validate_input_guardrails(
+          pasted_list_text=pasted_list_text,
+          shopping_list_title=shopping_list_title,
+          radius_km=radius_km,
+          tracer=tracer,
+      )
+      if pasted_list_text:
+        pasted_list_text = input_guardrail_verdict["sanitized_list_text"]
+      if shopping_list_title:
+        shopping_list_title = input_guardrail_verdict["sanitized_title"]
+
+      # Sub-Agent 1 Routing: GeospatialDiscoverySubAgent (gemini-2.5-flash)
+      routing_decisions.append(
+          self.model_router.route_task(
+              task_name="resolve_postcode_and_discover_20km_stores",
+              agent_name="GeospatialDiscoverySubAgent",
+              complexity_tier="LOW",
+              estimated_prompt_tokens=180,
+          )
+      )
       # Optional Stage 0a: Resolve UK Postcode to reset location & 20km search
       if postcode and postcode.strip():
         with tracer.start_span(
             "tool.resolve_uk_postcode",
             postcode=postcode.strip(),
+            agent_name="GeospatialDiscoverySubAgent",
+            model_id=self.model_router.FAST_MODEL,
         ) as pc_span:
-          override_location = resolve_uk_postcode(postcode.strip())
+          pc_env = execute_tool_with_llm_guidance(
+              "resolve_uk_postcode", postcode=postcode.strip()
+          )
+          if pc_env.status == "error":
+            pc_span.set_attribute("llm_recovery_triggered", True)
+            pc_span.set_attribute(
+                "llm_recovery_instructions", pc_env.llm_recovery_instructions
+            )
+            override_location = resolve_uk_postcode(
+                pc_env.suggested_arguments.get("postcode", "PO20 3SJ")
+            )
+          else:
+            override_location = resolve_uk_postcode(postcode.strip())
           pc_span.set_attribute("resolved.latitude", override_location.latitude)
           pc_span.set_attribute("resolved.longitude", override_location.longitude)
           pc_span.set_attribute("resolved.label", override_location.label)
@@ -306,7 +361,7 @@ class GroceryOptimizationOrchestrator:
           else "Online Shop Validity Check: All items on this list are ambient wholefoods/pantry and can be fulfilled online. "
       )
 
-      executive_summary = (
+      draft_summary = (
           f"Evaluated {len(physical_in_radius)} supermarkets within {radius_km:.0f}km of {location.label} "
           f"plus {len(online_included)} UK online retailers. "
           f"{validity_headline}"
@@ -314,8 +369,52 @@ class GroceryOptimizationOrchestrator:
           f"at £{best_single.effective_best_total:.2f} (saving £{max_savings_vs_worst:.2f} vs highest-cost regular store). "
           f"{online_hybrid_plan.rationale if online_hybrid_plan else (split_option.rationale if split_option else '')}"
       )
+
+      # Stage 5: Context Bloat Compaction & Model-Routed LLM Synthesis
+      history_runs = self.memory.list_shopping_history(user_id=user_id, limit=10)
+      compacted_context = self.context_manager.build_compacted_prompt_context(
+          agent_role="COORDINATOR_AGENT",
+          user_profile=profile,
+          history_runs=history_runs,
+          quotes=store_quotes,
+      )
+      routing_decisions.append(
+          self.model_router.route_task(
+              task_name="evaluate_loyalty_roi_and_online_split_tradeoffs",
+              agent_name="PricingAndLoyaltySubAgent",
+              complexity_tier="HIGH",
+              estimated_prompt_tokens=compacted_context["compacted_context_tokens"],
+              requires_multi_store_tradeoff=True,
+          )
+      )
+      executive_summary = self.model_router.generate_executive_advice(
+          compacted_context=compacted_context,
+          deterministic_draft_summary=draft_summary,
+          tracer=tracer,
+      )
+
+      # Stage 6: Output Guardrails (Anti-Hallucination & 100% Single-Store Fulfillment)
+      verified_store_ids = {s.store_id for s in stores_within}
+      output_guardrail_verdict = self.guardrails.validate_output_guardrails(
+          best_single=best_single,
+          online_hybrid_plan=online_hybrid_plan,
+          verified_store_ids=verified_store_ids,
+          executive_summary=executive_summary,
+          tracer=tracer,
+      )
+
+      # Stage 7: Human-in-the-Loop (HITL) Approval Checkpoint
+      hitl_req = self.hitl_gate.evaluate_hitl_checkpoint(
+          winning_total_cost_gbp=winning_total_cost,
+          best_single=best_single,
+          winning_strategy_type=winning_strategy_type,
+          spend_threshold_gbp=hitl_spend_threshold_gbp,
+          tracer=tracer,
+      )
+
       root_span.set_attribute("result.winning_strategy", winning_strategy_type)
       root_span.set_attribute("result.winning_total_cost_gbp", winning_total_cost)
+      root_span.set_attribute("hitl.status", hitl_req.status)
 
     trace_summary = tracer.export_trace_summary()
 
@@ -328,6 +427,21 @@ class GroceryOptimizationOrchestrator:
         }
         for s in stores_excluded
     ]
+
+    agent_metadata = {
+        "coordinator_agent": self.adk_hierarchy["root_agent"].name,
+        "sub_agents": [a.name for a in self.adk_hierarchy["sub_agents"]],
+        "model_routing_decisions": routing_decisions,
+        "input_guardrails": input_guardrail_verdict,
+        "output_guardrails": output_guardrail_verdict,
+        "context_window_compaction": {
+            "raw_unpruned_tokens": compacted_context["raw_unpruned_tokens"],
+            "compacted_context_tokens": compacted_context["compacted_context_tokens"],
+            "tokens_saved_by_compaction": compacted_context["tokens_saved_by_compaction"],
+            "within_token_budget": compacted_context["within_token_budget"],
+        },
+        "async_memory_worker_enabled": True,
+    }
 
     recommendation = OptimizationRecommendation(
         run_id=run_id,
@@ -350,10 +464,12 @@ class GroceryOptimizationOrchestrator:
         trace_summary=trace_summary,
         online_hybrid_plan=online_hybrid_plan,
         online_validity_audit=online_validity_audit,
+        agent_metadata=agent_metadata,
+        hitl_checkpoint=hitl_req.to_dict(),
     )
 
     if persist_run:
-      self.memory.record_new_shopping_list_run(
+      self.async_memory.enqueue_background_run_persistence(
           user_id=user_id,
           title=shopping_list_title,
           items=items,
@@ -363,6 +479,7 @@ class GroceryOptimizationOrchestrator:
           loyalty_savings_usd=best_single.loyalty_analysis.total_weekly_member_benefit,
           recommendation_dict=recommendation.to_dict(),
           list_id=list_id,
+          wait_for_completion=True,
       )
 
     return recommendation

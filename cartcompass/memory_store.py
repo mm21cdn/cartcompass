@@ -12,6 +12,10 @@ from typing import Any, Iterator
 import uuid
 
 from cartcompass.models import GeoCoordinate, ShoppingItemInput
+from cartcompass.observability import (
+    GLOBAL_PII_REDACTOR,
+    STRUCTURED_LOGGER,
+)
 
 
 DEFAULT_UK_LOYALTY_PROGRAMS: list[str] = [
@@ -238,7 +242,7 @@ class PersistentMemoryStore:
         if longitude is not None
         else profile["home_coordinate"].longitude
     )
-    new_label = (
+    new_label = GLOBAL_PII_REDACTOR.redact_text(
         home_label if home_label is not None else profile["home_coordinate"].label
     )
     new_programs = (
@@ -288,10 +292,14 @@ class PersistentMemoryStore:
       recommendation_dict: dict[str, Any],
       list_id: str | None = None,
   ) -> str:
-    """Appends a new weekly shopping list and updates recurring staple memory."""
+    """Appends a new weekly shopping list (with automatic PII redaction) and updates recurring staple memory."""
     list_id = list_id or f"LIST-{uuid.uuid4().hex[:8].upper()}"
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    serialized_items = [asdict(item) for item in items]
+    sanitized_title = GLOBAL_PII_REDACTOR.redact_text(title)
+    serialized_items = GLOBAL_PII_REDACTOR.redact_payload(
+        [asdict(item) for item in items]
+    )
+    sanitized_rec = GLOBAL_PII_REDACTOR.redact_payload(recommendation_dict)
 
     with self._connect() as conn:
       conn.execute(
@@ -305,18 +313,19 @@ class PersistentMemoryStore:
           (
               list_id,
               user_id,
-              title,
+              sanitized_title,
               now_iso,
               json.dumps(serialized_items),
               winning_strategy_type,
-              winning_store_summary,
+              GLOBAL_PII_REDACTOR.redact_text(winning_store_summary),
               round(winning_total_cost, 2),
               round(loyalty_savings_usd, 2),
-              json.dumps(recommendation_dict),
+              json.dumps(sanitized_rec),
           ),
       )
       for item in items:
-        norm_name = item.name.strip().lower()
+        clean_display_name = GLOBAL_PII_REDACTOR.redact_text(item.name.strip())
+        norm_name = clean_display_name.lower()
         existing = conn.execute(
             """
             SELECT times_ordered FROM item_frequency_memory
@@ -347,7 +356,7 @@ class PersistentMemoryStore:
               (
                   user_id,
                   norm_name,
-                  item.name.strip(),
+                  clean_display_name,
                   item.unit,
                   item.quantity,
                   now_iso,
@@ -435,3 +444,209 @@ class PersistentMemoryStore:
           (sku_id,),
       ).fetchone()
       return float(row["rolling_avg_price"]) if row else None
+
+
+# ---------------------------------------------------------------------------
+# LLM System Instructions, Context Window Compaction, and Async Memory Worker
+# ---------------------------------------------------------------------------
+from cartcompass.observability import (  # noqa: E402
+    GLOBAL_PII_REDACTOR,
+    STRUCTURED_LOGGER,
+)
+import asyncio  # noqa: E402
+from concurrent.futures import Future, ThreadPoolExecutor  # noqa: E402
+
+SYSTEM_INSTRUCTIONS: dict[str, str] = {
+    "COORDINATOR_AGENT": (
+        "You are the CartCompass UK Coordinator Agent for Eastergate, West Sussex, UK "
+        "(Default Postcode: PO20 3SJ, Lat: 50.845561, Lon: -0.643677). "
+        "Your mission is to orchestrate specialist sub-agents (`ListParserSubAgent`, "
+        "`GeospatialDiscoverySubAgent`, `PricingAndLoyaltySubAgent`, and `HybridSplitPlannerSubAgent`) "
+        "to optimize weekly grocery shopping lists within a strict 20.0 km Haversine radius plus UK Online "
+        "Retailers (Amazon UK, Grape Tree Health Foods, Whole Food Earth). "
+        "CRITICAL RULES:\n"
+        "1. Always format monetary values in British Pounds Sterling (GBP £).\n"
+        "2. Verify online basket fulfillment validity (`can_fulfill_entire_list`). Online ambient wholefood "
+        "shops CANNOT ship fresh/chilled milk, eggs, meat, fish, or bakery loaves via parcel post.\n"
+        "3. Never rank a partial-basket online shop as the #1 single-store winner; instead, generate an "
+        "explicit `ONLINE_PLUS_REGULAR_SHOP` split plan pairing online ambient items with a 20km supermarket.\n"
+        "4. If any tool returns `status='error'`, follow its `llm_recovery_instructions` immediately."
+    ),
+    "LIST_PARSER_SUB_AGENT": (
+        "You are the ListParserSubAgent (`gemini-2.5-flash`). Parse pasted multi-line UK grocery lists into "
+        "structured quantities, normalized UK units (`kg`, `l`, `dozen`, `loaf`, `pack`), and classify each "
+        "item as `AMBIENT_WHOLEFOOD` (eligible for online wholefood parcel delivery) or `FRESH_CHILLED` "
+        "(requires a physical 20km supermarket)."
+    ),
+    "GEOSPATIAL_DISCOVERY_SUB_AGENT": (
+        "You are the GeospatialDiscoverySubAgent (`gemini-2.5-flash`). Resolve UK postcodes via "
+        "`resolve_uk_postcode` and filter supermarkets strictly within `radius_km <= 20.0` using Haversine distance."
+    ),
+    "PRICING_AND_LOYALTY_SUB_AGENT": (
+        "You are the PricingAndLoyaltySubAgent (`gemini-2.5-pro`). Evaluate itemized basket totals, amortized "
+        "membership fees, points/cashback, and active UK loyalty advantages (Tesco Clubcard, Sainsbury's Nectar, "
+        "Lidl Plus, Costco UK) across all eligible stores."
+    ),
+    "HYBRID_SPLIT_PLANNER_SUB_AGENT": (
+        "You are the HybridSplitPlannerSubAgent (`gemini-2.5-pro`). When online wholefood shops cannot fulfill "
+        "fresh/chilled items standalone, compute the optimal 2-step `ONLINE_PLUS_REGULAR_SHOP` split plan."
+    ),
+}
+
+
+class ContextWindowManager:
+  """Manages LLM prompt token budgets, prunes bloated tool payloads, and summarizes episodic history."""
+
+  def __init__(self, max_context_tokens: int = 3200) -> None:
+    self.max_context_tokens = max_context_tokens
+
+  @staticmethod
+  def estimate_tokens(text_or_obj: Any) -> int:
+    """Approximates LLM token count (~4 characters per token)."""
+    if not isinstance(text_or_obj, str):
+      text_or_obj = json.dumps(text_or_obj, default=str)
+    return max(1, len(text_or_obj) // 4)
+
+  def compact_episodic_history(
+      self, history_runs: list[dict[str, Any]], max_recent_runs: int = 3
+  ) -> dict[str, Any]:
+    """Compresses multi-run shopping history into a concise semantic digest to prevent context bloat."""
+    recent = history_runs[:max_recent_runs]
+    older_count = max(0, len(history_runs) - max_recent_runs)
+    digest_lines = []
+    for run in recent:
+      digest_lines.append(
+          f"- {run.get('title', 'Run')}: {run.get('item_count', 0)} items -> "
+          f"{run.get('winning_store_summary', 'N/A')} (£{float(run.get('winning_total_cost', 0.0)):.2f})"
+      )
+    if older_count > 0:
+      avg_spend = sum(
+          float(r.get("winning_total_cost", 0.0)) for r in history_runs[max_recent_runs:]
+      ) / max(1, older_count)
+      digest_lines.append(
+          f"- [Compacted Episodic Summary of {older_count} older weekly shops: avg winning total £{avg_spend:.2f}]"
+      )
+    return {
+        "total_historical_runs": len(history_runs),
+        "retained_recent_runs": len(recent),
+        "compacted_older_runs": older_count,
+        "episodic_digest": "\n".join(digest_lines) if digest_lines else "No prior runs.",
+    }
+
+  def prune_store_quotes_for_llm_context(
+      self, quotes: list[Any]
+  ) -> list[dict[str, Any]]:
+    """Prunes verbose SKU line-item arrays from store quotes before passing to LLM reasoning prompts."""
+    pruned = []
+    for q in quotes:
+      pruned.append({
+          "store_id": q.store.store_id,
+          "store_name": q.store.name,
+          "store_type": q.store.store_type,
+          "distance_km": q.store.distance_km,
+          "can_fulfill_entire_list": q.can_fulfill_entire_list,
+          "fulfilled_items": f"{q.fulfilled_item_count}/{q.total_requested_item_count}",
+          "missing_items": q.missing_items[:4],
+          "effective_best_total_gbp": q.effective_best_total,
+          "net_weekly_loyalty_advantage_gbp": q.loyalty_analysis.net_weekly_advantage,
+      })
+    return pruned
+
+  def build_compacted_prompt_context(
+      self,
+      agent_role: str,
+      user_profile: dict[str, Any],
+      history_runs: list[dict[str, Any]],
+      quotes: list[Any],
+  ) -> dict[str, Any]:
+    raw_tokens = (
+        self.estimate_tokens(user_profile)
+        + self.estimate_tokens(history_runs)
+        + self.estimate_tokens([asdict(q) if hasattr(q, "__dataclass_fields__") else str(q) for q in quotes])
+    )
+    sys_inst = SYSTEM_INSTRUCTIONS.get(agent_role, SYSTEM_INSTRUCTIONS["COORDINATOR_AGENT"])
+    compacted_history = self.compact_episodic_history(history_runs)
+    pruned_quotes = self.prune_store_quotes_for_llm_context(quotes)
+    compacted_payload = {
+        "system_instruction": sys_inst,
+        "user_origin_postcode": getattr(user_profile.get("home_coordinate"), "postcode", "PO20 3SJ"),
+        "active_loyalty_programs": user_profile.get("active_loyalty_programs", []),
+        "episodic_memory_digest": compacted_history,
+        "pruned_store_quotes": pruned_quotes,
+    }
+    compacted_tokens = self.estimate_tokens(compacted_payload)
+    return {
+        "prompt_context": compacted_payload,
+        "raw_unpruned_tokens": raw_tokens,
+        "compacted_context_tokens": compacted_tokens,
+        "tokens_saved_by_compaction": max(0, raw_tokens - compacted_tokens),
+        "within_token_budget": compacted_tokens <= self.max_context_tokens,
+    }
+
+
+class AsyncMemoryConsolidator:
+  """Executes background/asynchronous memory persistence and episodic compaction without blocking."""
+
+  def __init__(self, memory_store: PersistentMemoryStore, max_workers: int = 2) -> None:
+    self.memory_store = memory_store
+    self._executor = ThreadPoolExecutor(
+        max_workers=max_workers, thread_name_prefix="cartcompass-async-mem"
+    )
+    self.completed_background_ops: int = 0
+
+  def enqueue_background_run_persistence(
+      self,
+      *,
+      user_id: str,
+      title: str,
+      items: list[ShoppingItemInput],
+      winning_strategy_type: str,
+      winning_store_summary: str,
+      winning_total_cost: float,
+      loyalty_savings_usd: float,
+      recommendation_dict: dict[str, Any],
+      list_id: str | None = None,
+       wait_for_completion: bool = True,
+  ) -> str:
+    """Schedules PII-redacted SQLite persistence and rolling SKU price consolidation on a background worker."""
+
+    def _worker() -> str:
+      saved_id = self.memory_store.record_new_shopping_list_run(
+          user_id=user_id,
+          title=title,
+          items=items,
+          winning_strategy_type=winning_strategy_type,
+          winning_store_summary=winning_store_summary,
+          winning_total_cost=winning_total_cost,
+          loyalty_savings_usd=loyalty_savings_usd,
+          recommendation_dict=recommendation_dict,
+          list_id=list_id,
+      )
+      self.completed_background_ops += 1
+      STRUCTURED_LOGGER.log_event(
+          "memory.async_background_consolidation_complete",
+          severity="INFO",
+          intent="Persist weekly shopping run & update episodic staple frequencies in background",
+          outcome="SUCCESS",
+          attributes={
+              "list_id": saved_id,
+              "completed_background_ops": self.completed_background_ops,
+              "pii_redacted": True,
+          },
+      )
+      return saved_id
+
+    future: Future[str] = self._executor.submit(_worker)
+    if wait_for_completion:
+      return future.result(timeout=5.0)
+    return list_id or "ASYNC-PENDING"
+
+  async def consolidate_session_memory_async(
+      self, user_id: str = "mrmitchell"
+  ) -> dict[str, Any]:
+    """Native asyncio coroutine for non-blocking episodic memory compaction."""
+    history = await asyncio.to_thread(
+        self.memory_store.list_shopping_history, user_id, 20
+    )
+    cwm = ContextWindowManager()
+    return cwm.compact_episodic_history(history)
